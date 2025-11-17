@@ -1,0 +1,265 @@
+---
+title: "Day 1 Download Bioconductor"
+---
+
+# Bioconductor: DESeq2 for RNA-seq counts
+# limma for microarray or log rna seq
+
+#Download the RNAseq data from BRCA dataset, breast cancer only
+#by NCI Genomic Data Commons (GDC)
+
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+  
+BiocManager::install(c("TCGAbiolinks", "DESeq2", 
+                       "ggplot2", "limma", "SummarizedExperiment"))
+```
+
+                    
+
+
+Day 2: Debug/To process the Data from BRCA
+
+```{r}
+manifest_path <- "F:/GDC_Data/GDCdata/manifest/gdc_manifest.txt"
+download_dir <- "F:/GDC_Data/GDCdata/"
+
+# Read the manifest (tab-delimited)
+manifest <- read.delim(manifest_path, header = TRUE)
+
+
+#or
+
+# Get UUIDs from manifest (first column)
+manifest_uuids <- read.delim(manifest_path)$id
+
+# Get UUIDs from downloaded folders
+downloaded_uuids <- list.files(download_dir)
+
+# Find missing folders
+missing_uuids <- setdiff(manifest_uuids, downloaded_uuids)
+
+# Print results
+cat("Total UUIDs in manifest:", length(manifest_uuids), "\n")
+cat("Downloaded folders found:", length(downloaded_uuids), "\n")
+cat("Missing folders:", length(missing_uuids), "\n")
+
+if (length(missing_uuids) > 0) {
+  cat("\nMissing UUID folders:\n")
+  print(missing_uuids)
+} else {
+  cat("\nAll UUID folders were downloaded successfully!\n")
+}
+
+```
+Day 2 To process the Data from BRCA (July 24,2025)
+
+Validate cell type and info contained
+
+```{r}
+# Check the files type and file content
+download_dir <- "F:/GDC_Data/GDCdata/"
+files <- list.files(download_dir, recursive = TRUE, pattern = "\\.tsv$|\\.txt$")
+head(files)  # Show first few files
+
+print("-------------------------------------------------------------------------------")
+# Read first 5 lines of a TSV file
+sample_file <- file.path(download_dir, files[1])
+readLines(sample_file, n = 5)
+
+
+print("-------------------------------------------------------------------------------")
+#import data to R
+library(data.table)
+
+# Set your ACTUAL download directory (where UUID folders are)
+download_dir <- "F:/GDC_Data/GDCdata/"
+
+# Get all TSV file paths (full paths)
+tsv_files <- list.files(
+  path = download_dir,
+  pattern = "augmented_star_gene_counts\\.tsv$",
+  recursive = TRUE,  # Search subfolders
+  full.names = TRUE  # Return full paths
+)
+
+# Check if files were found
+if (length(tsv_files) == 0) stop("No TSV files found! Check your download_dir path.")
+head(tsv_files)  # Verify paths look correct
+
+print("-------------------------------------------------------------------------------")
+# Test reading the FIRST file (replace [1] with a specific index if needed)
+test_file <- tsv_files[1]
+counts <- fread(
+  test_file,
+  skip = "gene_id",  # Skip to header row
+  select = c("gene_id", "gene_name", "gene_type", "unstranded")  # Keep essential columns
+)
+
+# Remove metadata rows (N_*)
+counts <- counts[!startsWith(gene_id, "N_"), ]
+head(counts)
+```
+
+
+
+Creating a clean data (star count row data) matrix 
+Rows: Genes (e.g., ENSG00000000003.15 = TSPAN6)
+
+Columns: Samples (each UUID represents one patient/tumor)
+
+Values: Raw read counts (integer values from the unstranded column in your TSV files)
+
+
+```{r}
+# Make a clean data for all the gene
+library(data.table)
+
+# Set your download directory (confirmed from your output)
+download_dir <- "F:/GDC_Data/GDCdata/"
+
+# Get all TSV files (full paths)
+tsv_files <- list.files(
+  path = download_dir,
+  pattern = "augmented_star_gene_counts\\.tsv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+# Verify files
+head(tsv_files)  # Should match your printed paths
+
+# Function to read a single file
+read_counts <- function(file) {
+  dt <- fread(
+    file,
+    skip = "gene_id",  # Skip to header row
+    select = c("gene_id", "unstranded")  # Keep only gene_id and raw counts
+  )
+  # Use UUID as column name
+  setnames(dt, "unstranded", basename(dirname(file)))
+  return(dt)
+}
+
+# Read all files sequentially
+counts_list <- lapply(tsv_files, read_counts)
+
+
+print("Merge all samples -----------------------------")
+# Merge by gene_id
+count_matrix <- Reduce(
+  function(x, y) merge(x, y, by = "gene_id", all = TRUE),
+  counts_list
+)
+
+# Convert to matrix (genes as rownames)
+gene_ids <- count_matrix$gene_id
+count_matrix <- as.matrix(count_matrix[, -1, with = FALSE])
+rownames(count_matrix) <- gene_ids
+
+# Remove metadata rows (N_*)
+count_matrix <- count_matrix[!startsWith(rownames(count_matrix), "N_"), ]
+
+
+```
+annotation for gene info
+```{r}
+# Extract gene info from the first file
+gene_annot <- fread(
+  tsv_files[1],
+  skip = "gene_id",
+  select = c("gene_id", "gene_name", "gene_type")
+)
+gene_annot <- gene_annot[!startsWith(gene_id, "N_"), ]
+```
+
+save raw count matrix
+```{r}
+saveRDS(list(counts = count_matrix, genes = gene_annot), "TCGA_BRCA_Counts_Raw.rds")
+
+```
+
+
+
+#After build the raw count matrix
+
+
+for loading later
+
+```{r}
+# Load later
+data <- readRDS("TCGA_BRCA_Counts_Raw.rds")
+count_matrix <- data$counts
+gene_annot <- data$genes
+```
+
+Visualization of the raw data 
+
+heatmap download
+```{r}
+# Load later
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("pheatmap")
+
+```
+
+
+convert esemble ID to gene name
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("org.Hs.eg.db")  # Human gene database
+library(org.Hs.eg.db)
+
+```
+
+visualize both the heatmap (top ten most variable genes) and also Esemble ID vs.Gene name Table
+
+```{r}
+library(pheatmap)
+
+# 1. Log-transform counts (for better contrast)
+log_counts <- log1p(count_matrix)  # log(count + 1)
+
+# 2. Select top variable genes (e.g., top 10)
+top_genes <- names(sort(apply(log_counts, 1, var), decreasing = TRUE)[1:10])
+
+# 3. Create a data frame linking ENSEMBL IDs to gene names
+gene_mapping_table <- data.frame(
+  ENSEMBL_ID = top_genes,
+  Gene_Name = gene_annot$gene_name[match(top_genes, gene_annot$gene_id)]
+)
+
+# Print to console
+print(gene_mapping_table)
+
+# 4. Plot
+pheatmap(
+  log_counts[top_genes, ],
+  scale = "row",          # Z-score normalize by gene
+  show_rownames = TRUE,   # Show gene names
+  show_colnames = FALSE,  # Hide sample IDs (too many)
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  main = "Top 10 Variable Genes (log2CPM)"
+)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
