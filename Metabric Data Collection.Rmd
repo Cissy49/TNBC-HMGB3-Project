@@ -1,0 +1,299 @@
+---
+title: "TNBC from Metabric database"
+author: "Lufei Liu"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+```{r}
+tinytex::install_tinytex()
+```
+
+# pick sample ID for the TNBC
+
+```{r}
+# Read clinical file (adjust path/format)
+clinical <- read.delim("F:/METABRIC/brca_metabric/data_clinical_sample.txt", sep = "\t", header = TRUE)
+
+colnames(clinical)
+
+# Filter TNBC: ER-/PR-/HER2-
+tnbc_clinical <- subset(clinical, 
+                       ER.Status == "Negative" & 
+                       PR.Status == "Negative" & 
+                       HER2.Status == "Negative")
+
+# Get TNBC sample IDs
+tnbc_samples <- tnbc_clinical$Sample.Identifier  # Or column matching your file
+print(tnbc_samples)
+```
+
+1. Load Expression Matrix
+```{r}
+library(dplyr)
+library(tibble)
+# Load expression matrix with proper handling of duplicates
+expr_raw <- read.delim("F:/METABRIC/brca_metabric/data_mrna_illumina_microarray.txt", 
+                      header = TRUE, 
+                      sep = "\t", 
+                      check.names = FALSE,
+                      stringsAsFactors = FALSE)
+
+expr <- expr_raw %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  column_to_rownames("Hugo_Symbol") %>%
+  select(-Entrez_Gene_Id)  # Remove Entrez column if it exists
+expr_t <- as.data.frame(t(expr))
+```
+
+1.1 create a TNBC only data
+```{r}
+# Keep only TNBC samples in the expression matrix
+expr_tnbc <- expr_t[rownames(expr_t) %in% tnbc_samples, ]
+# Verify dimensions
+dim(expr_tnbc)  # Should show: [number of TNBC samples] x [number of genes]
+
+# Check for missing samples
+setdiff(tnbc_samples, rownames(expr_t))  # Should return empty if all samples exist
+write.csv(expr_tnbc, "TNBC_expression_matrix.csv")  
+```
+2. Load Clinical Data and Label TNBC
+```{r}
+expr_t$TNBC_Status <- ifelse(rownames(expr_t) %in% tnbc_samples, "TNBC", "non-TNBC")
+# Verify
+table(expr_t$TNBC_Status)  # Check counts of each group
+head(expr_t[, c(1:5, ncol(expr_t))])  # View first 5 genes + status column
+# Create version with all samples but labeled
+expr_labeled <- expr_t  # Already has the TNBC_Status column
+write.csv(expr_labeled, "all_labeled_matrix.csv")  
+```
+
+3. Visualize TNBC vs. non-TNBC
+```{r}
+library(tidyverse)
+library(FactoMineR)
+
+# Read your labeled CSV file
+labeled_data <- read_csv("F:/bioinformatics independent proj/main proj/all_labeled_matrix.csv")  
+
+# Identify numeric columns (excluding labels)
+numeric_cols <- labeled_data %>% 
+  select(where(is.numeric)) %>% 
+  select(-matches("TNBC_Status"))
+
+# Handle missing values if needed
+
+if(any(is.na(numeric_cols))) {
+  numeric_cols <- numeric_cols %>% 
+    mutate(across(everything(), ~replace_na(., mean(., na.rm = TRUE))))
+}  # Now properly closed
+
+# Perform PCA
+pca_res <- PCA(numeric_cols, graph = FALSE)
+
+# Create plotting data frame
+pca_df <- data.frame(
+  PC1 = pca_res$ind$coord[,1],
+  PC2 = pca_res$ind$coord[,2],
+  TNBC_Status = labeled_data$TNBC_Status  # Use your label column
+)
+
+# Generate plot with custom colors
+ggplot(pca_df, aes(x = PC1, y = PC2, color = TNBC_Status)) +
+  geom_point(size = 1.3, alpha = 0.7) +
+  scale_color_manual(
+    values = c("TNBC" = "#FF69B4",  # Pink
+               "non-TNBC" = "#1E90FF"),  # Blue
+    name = "TNBC Status"
+  ) +
+  labs(
+    title = "PCA of Breast Cancer Samples",
+    x = paste0("PC1 (", round(pca_res$eig[1,2], 1), "%)"),
+    y = paste0("PC2 (", round(pca_res$eig[2,2], 1), "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+ggsave("TNBC vs non-TNBC PCA.pdf", width = 10, height = 8, device = cairo_pdf)
+
+
+```
+
+```{r}
+library(limma)
+library(tidyverse)
+# Read your labeled CSV file
+
+
+labeled_data <- read_csv("F:/bioinformatics independent proj/main proj/all_labeled_matrix.csv")  
+# Design matrix
+design <- model.matrix(~0 + TNBC_Status, data = labeled_data)
+colnames(design) <- c("nonTNBC", "TNBC")
+
+
+# Identify numeric columns (excluding labels)
+numeric_cols <- labeled_data %>% 
+  select(where(is.numeric)) %>% 
+  select(-matches("TNBC_Status"))
+
+# Fit linear model
+fit <- lmFit(t(numeric_cols), design)
+contrast <- makeContrasts(TNBC - nonTNBC, levels = design)
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+# Get results (sorted by p-value)
+de_genes <- topTable(fit2, number = Inf, sort.by = "P")
+head(de_genes, 10)  # View top 10 DEGs
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# 1. Prepare the data (handling p=0 cases)
+volcano_data <- de_genes %>%
+  tibble::rownames_to_column("Gene") %>%
+  mutate(
+    # Handle p=0 by replacing with half the smallest detectable p-value
+    adj.P.Val = ifelse(adj.P.Val == 0, min(adj.P.Val[adj.P.Val > 0], na.rm = TRUE)/2, adj.P.Val),
+    Significance = case_when(
+      adj.P.Val < 0.05 & abs(logFC) > 1 ~ "Significant",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# 2. Define genes of interest 
+genes_of_interest <- c("FOXA1", "MLPH", "GATA3", "ESR1", "AGR3", "TFF3", "CA12", "SPDEF","XBP1","TBC1D9")
+
+# 3. Create the volcano plot with special treatment for FOXA1 and MLPH
+ggplot(volcano_data, aes(x = logFC, y = -log10(adj.P.Val))) +
+  # Background points
+  geom_point(
+    aes(color = Significance), 
+    alpha = 0.6, 
+    size = 2
+  ) +
+  scale_color_manual(
+    values = c(
+      "Significant" = "red",
+      "Not significant" = "gray70"
+    )
+  ) +
+  # Highlight all genes of interest (blue circles)
+  geom_point(
+    data = filter(volcano_data, Gene %in% genes_of_interest & !Gene %in% c("FOXA1", "MLPH")),
+    color = "blue",
+    size = 1.3
+  ) +
+ 
+
+  # Labels for all genes of interest
+  geom_text_repel(
+    data = filter(volcano_data, Gene %in% genes_of_interest),
+    aes(
+      label = Gene,
+      fontface = ifelse(Gene %in% c("FOXA1", "MLPH"), "bold", "plain"),
+      color = ifelse(Gene %in% c("FOXA1", "MLPH"), "red", "blue")
+    ),
+    box.padding = 0.5,
+    max.overlaps = Inf,
+    size = 3.3
+  ) +
+  # Reference lines
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  # Labels and theme
+  labs(
+    title = "Volcano Plot of TNBC Transcriptome",
+    x = "log2 Fold Change",
+    y = "-log10(Adjusted p-value)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+ggsave("TNBC_volcano.pdf", width = 10, height = 8, device = cairo_pdf)
+```
+
+create TNBC only data (methylation, mutation, cna)
+
+```{r}
+# for methylation
+library(dplyr)
+library(tibble)
+# Load expression matrix with proper handling of duplicates
+methyl_raw <- read.delim("F:/METABRIC/brca_metabric/data_methylation_promoters_rrbs.txt", 
+                      header = TRUE, 
+                      sep = "\t", 
+                      check.names = FALSE,
+                      stringsAsFactors = FALSE)
+
+methyl <- methyl_raw %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  column_to_rownames("Hugo_Symbol")
+methyl_t <- as.data.frame(t(methyl))
+
+# Keep only TNBC samples in the expression matrix
+methyl_tnbc <- methyl_t[rownames(methyl_t) %in% tnbc_samples, ]
+# Verify dimensions
+dim(methyl_tnbc)  # Should show: [number of TNBC samples] x [number of genes]
+
+# Check for missing samples
+setdiff(tnbc_samples, rownames(methyl_t))  # Should return empty if all samples exist
+write.csv(methyl_tnbc, "TNBC_methylation_matrix.csv")  
+
+```
+
+
+```{r}
+#for cna
+library(dplyr)
+library(tibble)
+# Load expression matrix with proper handling of duplicates
+cna_raw <- read.delim("F:/METABRIC/brca_metabric/data_cna.txt", 
+                      header = TRUE, 
+                      sep = "\t", 
+                      check.names = FALSE,
+                      stringsAsFactors = FALSE)
+
+cna <- cna_raw %>%
+  group_by(Hugo_Symbol) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  column_to_rownames("Hugo_Symbol") 
+cna_t <- as.data.frame(t(cna))
+
+# Keep only TNBC samples in the expression matrix
+cna_tnbc <- cna_t[rownames(cna_t) %in% tnbc_samples, ]
+# Verify dimensions
+dim(cna_tnbc)  # Should show: [number of TNBC samples] x [number of genes]
+
+# Check for missing samples
+setdiff(tnbc_samples, rownames(cna_t))  # Should return empty if all samples exist
+write.csv(cna_tnbc, "TNBC_cna_matrix.csv") 
+```
+```{r}
+# Read each file and check column count
+file1 <- read.csv("F:/bioinformatics independent proj/main proj/TNBC_expression_matrix.csv")
+file2 <- read.csv("F:/bioinformatics independent proj/main proj/TNBC_methylation_matrix.csv")
+file3 <- read.csv("F:/bioinformatics independent proj/main proj/TNBC_cna_matrix.csv")
+
+cat("File 1 has", ncol(file1), "columns\n")
+cat("File 2 has", ncol(file2), "columns\n")
+cat("File 3 has", ncol(file3), "columns\n")
+```
+
+
+Multi omics construction (TNBC only)
+
+```{r}
+tnbc_samples <- read_csv("TNBC_expression_matrix.csv")
+
+```
+
